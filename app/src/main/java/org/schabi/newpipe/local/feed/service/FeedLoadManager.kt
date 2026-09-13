@@ -20,6 +20,7 @@ import org.schabi.newpipe.extractor.feed.FeedInfo
 import org.schabi.newpipe.extractor.ListInfo
 import org.schabi.newpipe.extractor.exceptions.ContentNotAvailableException
 import org.schabi.newpipe.extractor.exceptions.ContentNotSupportedException
+import org.schabi.newpipe.extractor.exceptions.ExtractionException
 import org.schabi.newpipe.extractor.stream.StreamInfoItem
 import org.schabi.newpipe.local.feed.FeedDatabaseManager
 import org.schabi.newpipe.local.subscription.SubscriptionManager
@@ -54,7 +55,13 @@ class FeedLoadManager(private val context: Context) {
 
 
     private fun getServiceDelay(serviceId: Int): Long {
-        return NewPipe.getService(serviceId).feedFetchInterval;
+        return try {
+            NewPipe.getService(serviceId).feedFetchInterval
+        } catch (e: ExtractionException) {
+            // stale subscription from a service that's no longer registered (e.g. restored
+            // from an old backup); fall back to no extra delay rather than crashing the load
+            0L
+        }
     }
 
     /**

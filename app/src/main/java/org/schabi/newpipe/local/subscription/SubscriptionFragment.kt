@@ -14,7 +14,9 @@ import com.xwray.groupie.GroupAdapter
 import com.xwray.groupie.Item
 import com.xwray.groupie.Section
 import com.xwray.groupie.viewbinding.GroupieViewHolder
+import io.reactivex.rxjava3.android.schedulers.AndroidSchedulers
 import io.reactivex.rxjava3.disposables.CompositeDisposable
+import io.reactivex.rxjava3.schedulers.Schedulers
 import org.schabi.newpipe.R
 import org.schabi.newpipe.database.feed.model.FeedGroupEntity
 import org.schabi.newpipe.databinding.DialogTitleBinding
@@ -23,8 +25,12 @@ import org.schabi.newpipe.databinding.FragmentSubscriptionBinding
 import org.schabi.newpipe.error.ErrorInfo
 import org.schabi.newpipe.error.UserAction
 import org.schabi.newpipe.extractor.channel.ChannelInfoItem
+import org.schabi.newpipe.extractor.stream.StreamInfoItem
 import org.schabi.newpipe.fragments.BaseStateFragment
 import org.schabi.newpipe.ktx.animate
+import org.schabi.newpipe.local.feed.FeedDatabaseManager
+import org.schabi.newpipe.local.feed.service.FeedEventManager
+import org.schabi.newpipe.local.feed.service.FeedLoadService
 import org.schabi.newpipe.local.subscription.SubscriptionViewModel.SubscriptionState
 import org.schabi.newpipe.local.subscription.dialog.FeedGroupDialog
 import org.schabi.newpipe.local.subscription.dialog.FeedGroupReorderDialog
@@ -32,12 +38,15 @@ import org.schabi.newpipe.local.subscription.item.*
 import org.schabi.newpipe.local.subscription.item.HeaderWithMenuItem.Companion.PAYLOAD_UPDATE_VISIBILITY_MENU_ITEM
 import org.schabi.newpipe.local.subscription.services.SubscriptionsExportService.EXPORT_COMPLETE_ACTION
 import org.schabi.newpipe.local.subscription.services.SubscriptionsImportService.IMPORT_COMPLETE_ACTION
+import org.schabi.newpipe.player.playqueue.SinglePlayQueue
 import org.schabi.newpipe.util.NavigationHelper
 import org.schabi.newpipe.util.OnClickGesture
 import org.schabi.newpipe.util.ThemeHelper.getGridSpanCountChannels
 import org.schabi.newpipe.util.ThemeHelper.shouldUseGridLayout
 import org.schabi.newpipe.util.external_communication.ShareUtils
+import java.util.concurrent.TimeUnit
 import kotlin.math.max
+import kotlin.random.Random
 
 class SubscriptionFragment : BaseStateFragment<SubscriptionState>() {
     private var _binding: FragmentSubscriptionBinding? = null
@@ -46,6 +55,7 @@ class SubscriptionFragment : BaseStateFragment<SubscriptionState>() {
     private lateinit var viewModel: SubscriptionViewModel
     private lateinit var subscriptionManager: SubscriptionManager
     private lateinit var importExportHelper: SubscriptionsImportExportHelper
+    private lateinit var feedDatabaseManager: FeedDatabaseManager
     private val disposables: CompositeDisposable = CompositeDisposable()
 
     private var subscriptionBroadcastReceiver: BroadcastReceiver? = null
@@ -81,6 +91,7 @@ class SubscriptionFragment : BaseStateFragment<SubscriptionState>() {
         super.onAttach(context)
         subscriptionManager = SubscriptionManager(requireContext())
         importExportHelper = SubscriptionsImportExportHelper(this)
+        feedDatabaseManager = FeedDatabaseManager(requireContext())
     }
 
     override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View? {
@@ -329,16 +340,124 @@ class SubscriptionFragment : BaseStateFragment<SubscriptionState>() {
     private val listenerFeedGroups = object : OnClickGesture<Item<*>>() {
         override fun selected(selectedItem: Item<*>?) {
             when (selectedItem) {
-                is FeedGroupCardItem -> NavigationHelper.openFeedFragment(fm, selectedItem.groupId, selectedItem.name)
+                is FeedGroupCardItem -> {
+                    if (selectedItem.groupId == FeedGroupEntity.GROUP_ALL_ID) {
+                        NavigationHelper.openFeedFragment(fm, selectedItem.groupId, selectedItem.name)
+                    } else {
+                        shufflePlayGroup(selectedItem.groupId)
+                    }
+                }
                 is FeedGroupAddItem -> FeedGroupDialog.newInstance().show(fm, null)
             }
         }
 
         override fun held(selectedItem: Item<*>?) {
             when (selectedItem) {
-                is FeedGroupCardItem -> FeedGroupDialog.newInstance(selectedItem.groupId).show(fm, null)
+                is FeedGroupCardItem -> showFeedGroupLongTapDialog(selectedItem)
             }
         }
+    }
+
+    private fun showFeedGroupLongTapDialog(item: FeedGroupCardItem) {
+        val commands = arrayOf(
+            getString(R.string.feed_group_shuffle_play),
+            getString(R.string.feed_group_view_feed),
+            getString(R.string.feed_group_edit)
+        )
+
+        val actions = DialogInterface.OnClickListener { _, which ->
+            when (which) {
+                0 -> shufflePlayGroup(item.groupId)
+                1 -> NavigationHelper.openFeedFragment(fm, item.groupId, item.name)
+                2 -> FeedGroupDialog.newInstance(item.groupId).show(fm, null)
+            }
+        }
+
+        val dialogTitleBinding = DialogTitleBinding.inflate(LayoutInflater.from(requireContext()))
+        dialogTitleBinding.root.isSelected = true
+        dialogTitleBinding.itemTitleView.text = item.name
+        dialogTitleBinding.itemAdditionalDetails.visibility = View.GONE
+
+        AlertDialog.Builder(requireContext())
+            .setCustomTitle(dialogTitleBinding.root)
+            .setItems(commands, actions)
+            .create()
+            .show()
+    }
+
+    /**
+     * Shuffle-plays every cached video from this group's channels in the main video player,
+     * starting on a random one. If the group hasn't been synced yet, triggers a feed load first.
+     */
+    private fun shufflePlayGroup(groupId: Long) {
+        disposables.add(
+            feedDatabaseManager.subscriptionIdsForGroup(groupId)
+                .firstOrError()
+                .subscribe({ subscriptionIds ->
+                    if (subscriptionIds.isEmpty()) {
+                        Toast.makeText(requireContext(), R.string.feed_group_shuffle_no_channels, Toast.LENGTH_SHORT).show()
+                    } else {
+                        queryAndShufflePlay(groupId, allowFeedLoad = true)
+                    }
+                }, {})
+        )
+    }
+
+    private fun queryAndShufflePlay(groupId: Long, allowFeedLoad: Boolean) {
+        disposables.add(
+            feedDatabaseManager.getStreams(groupId, getPlayedStreams = true)
+                .subscribeOn(Schedulers.io())
+                .observeOn(AndroidSchedulers.mainThread())
+                .subscribe({ streams ->
+                    onGroupStreamsLoaded(streams.map { it.stream.toStreamInfoItem() }, groupId, allowFeedLoad)
+                }, {
+                    onGroupStreamsLoaded(emptyList(), groupId, allowFeedLoad)
+                }, {
+                    onGroupStreamsLoaded(emptyList(), groupId, allowFeedLoad)
+                })
+        )
+    }
+
+    private fun onGroupStreamsLoaded(items: List<StreamInfoItem>, groupId: Long, allowFeedLoad: Boolean) {
+        if (items.isNotEmpty()) {
+            val queue = SinglePlayQueue(items, Random.nextInt(items.size))
+            queue.shuffle()
+            NavigationHelper.playOnMainPlayer(activity, queue)
+        } else if (allowFeedLoad) {
+            Toast.makeText(requireContext(), R.string.feed_group_shuffle_loading, Toast.LENGTH_SHORT).show()
+            loadGroupFeedThenShufflePlay(groupId)
+        } else {
+            Toast.makeText(requireContext(), R.string.feed_group_shuffle_no_videos, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun loadGroupFeedThenShufflePlay(groupId: Long) {
+        disposables.add(
+            FeedEventManager.events()
+                .skip(1) // ignore the replayed current/stale event
+                .filter {
+                    it is FeedEventManager.Event.SuccessResultEvent ||
+                        it is FeedEventManager.Event.ErrorResultEvent
+                }
+                .firstOrError()
+                .timeout(30, TimeUnit.SECONDS)
+                .observeOn(AndroidSchedulers.mainThread())
+                .subscribe({ event ->
+                    if (event is FeedEventManager.Event.ErrorResultEvent) {
+                        Toast.makeText(requireContext(), R.string.feed_group_shuffle_no_videos, Toast.LENGTH_SHORT).show()
+                    } else {
+                        queryAndShufflePlay(groupId, allowFeedLoad = false)
+                    }
+                }, {
+                    Toast.makeText(requireContext(), R.string.feed_group_shuffle_no_videos, Toast.LENGTH_SHORT).show()
+                })
+        )
+
+        requireContext().startService(
+            Intent(requireContext(), FeedLoadService::class.java).apply {
+                putExtra(FeedLoadService.EXTRA_GROUP_ID, groupId)
+            }
+        )
     }
 
     private val listenerChannelItem = object : OnClickGesture<ChannelInfoItem>() {
